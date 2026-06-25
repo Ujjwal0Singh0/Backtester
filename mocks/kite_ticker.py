@@ -33,8 +33,6 @@ class MockKiteTicker:
         self._subscribed_tokens: List[int] = []
         self._mode_map: Dict[int, str] = {}
 
-        pass
-
     """def on_ticks(self, ws: Any, ticks: List[Dict[str, Any]]) -> None:
 
         Callback triggered when a new tick is received.
@@ -54,7 +52,6 @@ class MockKiteTicker:
         self.is_connected=True
         if self.on_connect:
             self.on_connect(self,None)
-        raise NotImplementedError
         
     def close(self, code: int =None, reason:str=None) -> None:
         """
@@ -63,27 +60,23 @@ class MockKiteTicker:
         self.is_connected=False
         if self.on_close:
             self.on_close(self,code,reason)
-        raise NotImplementedError
     
     def subscribe(self,instrument_tokens:List[int])->None:
         #mirrors kws.subscribe
         for token in instrument_tokens:
             if token not in self._subscribed_tokens:
                 self._subscribed_tokens.append(token)
-        raise NotImplementedError
     
     def unsubscribe(self, instrument_tokens: List[int]) -> None:
         for token in instrument_tokens:
             if token in self._subscribed_tokens:
                 self._subscribed_tokens.remove(token)
             self._mode_map.pop(token, None)
-        raise NotImplementedError
     
     def set_mode(self,mode:str,instrument_tokens:List[int])->None:
         #mirrors kws.set_mode
         for token in instrument_tokens:
             self._mode_map[token]=mode
-        raise NotImplementedError
     
     #Mode constants
     MODE_FULL="full"
