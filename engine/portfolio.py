@@ -1,38 +1,28 @@
 """
 The active ledger tracking Cash, Margin, and Positions.
 
-Design notes (decisions made during planning):
-- `available_cash` is a single shared number across all symbols.
-- `positions` is a dict keyed by symbol, where each value is a FIFO deque of
-  individual lots: {"quantity": int, "price": float, "timestamp": str}.
-  Lots (not blended averages) are required because settlement must match
-  exits to entries on a strict First-In-First-Out basis.
-- `logger` (TransactionLogger) and `tax_api` (TaxDividendAPI) are OPTIONAL,
-  injected dependencies (Dependency Injection), not constructed internally.
-  This keeps Portfolio detachable/testable: pass None to disable either.
-- Deliberately did NOT assume rich OrderEvent/FillEvent/TickEvent classes.
-  Only relied on a minimal set of attributes via getattr(), since those
-  classes are owned by other contributors and may evolve independently.
+REVISED to match the now-finalized mocks/kite_connect.py and
+metrics/transaction_logger.py:
 
-Minimal assumed shape of a FillEvent (read via getattr, all but symbol/side/
-quantity/price are optional with safe defaults):
-    order_id   (str)   - optional, used only for logging context
-    symbol     (str)   - required
-    side       (str)   - required, "BUY" or "SELL"
-    quantity   (int)   - required
-    price      (float) - required, actual execution price
-    timestamp  (str)   - optional, defaults to "" if missing
-    fees       (float) - optional, defaults to 0.0
+- Events (OrderEvent/FillEvent) are plain dicts with Kite-style keys:
+  "tradingsymbol" (not "symbol"), "transaction_type" (not "side"),
+  "quantity", "price", "order_id", "fees" (optional), "timestamp" (optional).
+  This mirrors exactly what MockKiteConnect.place_order() builds, and what
+  TransactionLogger.log_event() already expects (it falls back between
+  "symbol"/"tradingsymbol" and "side"/"transaction_type").
 
-Minimal assumed shape of a TickEvent (read via getattr):
-    symbol      (str)   - required
-    last_price  (float) - required (falls back to .close if present)
-    timestamp   (str)   - optional
+- kite_connect.positions()/ltp()/quote() all read self.portfolio.positions
+  as: {symbol: {"quantity", "average_price", "current_price", "product",
+  "exchange", "instrument_token"}} — ONE FLAT DICT per symbol, not a list
+  of lots. Since kite_connect.py is already finalized and reads this shape
+  directly, `self.positions` MUST stay in this flat/aggregated form.
 
-Minimal assumed shape of what `tax_api.calculate_settlement(...)` returns:
-    a dict containing at least "net_adjustment" (float) - everything else
-    (stt, brokerage, exchange_fees, etc.) is optional and only used for
-    logging detail if present.
+  FIFO lot-level detail (needed for correct settlement matching) is instead
+  kept privately in `self._lots`, and is never read by kite_connect.
+
+- `logger` and `tax_api` remain optional, injected (Dependency Injection),
+  defaulting to None so either can be detached without touching this
+  class's internals.
 """
 
 from collections import deque
@@ -43,14 +33,35 @@ from settlement.tax_dividend_api import TaxDividendAPI
 from metrics.transaction_logger import TransactionLogger
 
 
+def _get(event: Any, *keys: str, default: Any = None) -> Any:
+    """
+    Reads a field off an event that may be a dict OR an object, trying
+    each candidate key/attribute name in order. This insulates Portfolio
+    from minor naming differences across event producers (e.g. "quantity"
+    vs "filled_quantity"), matching the same defensive style already used
+    in transaction_logger.py.
+    """
+    for key in keys:
+        if isinstance(event, dict):
+            if key in event and event[key] is not None:
+                return event[key]
+        else:
+            value = getattr(event, key, None)
+            if value is not None:
+                return value
+    return default
+
+
 class Portfolio:
     """
-    Maintains available_cash and a per-symbol FIFO lot ledger.
-    Marks positions to market on every tick.
+    Maintains available_cash and a per-symbol position ledger.
 
-    `logger` and `tax_api` are optional collaborators (Dependency Injection).
-    Pass None for either to disable that behavior without changing this
-    class's internals.
+    `positions` (flat, aggregated) is the PUBLIC shape kite_connect.py
+    reads from directly — do not change its structure without checking
+    kite_connect.py's margins()/positions()/ltp()/quote() implementations.
+
+    `_lots` (FIFO deques) is PRIVATE — used only internally for correct
+    FIFO settlement matching. Nothing outside Portfolio should read it.
     """
 
     def __init__(
@@ -64,32 +75,29 @@ class Portfolio:
         Initializes the Portfolio.
 
         Args:
-            event_bus (EventBus): The centralized event bus. Portfolio itself
-                doesn't currently need to publish anything onto it (the
-                simulator is responsible for routing FillEvents to us), but
-                we keep the reference for symmetry with other modules and
-                in case future settlement events need to be published.
+            event_bus (EventBus): The centralized event bus (kept for symmetry
+                with other modules; Portfolio doesn't currently publish).
             initial_capital (float): The starting cash balance.
             logger (Optional[TransactionLogger]): Object exposing `log_event(event)`.
                 If None, logging is silently skipped.
             tax_api (Optional[TaxDividendAPI]): Object exposing
                 `calculate_settlement(entry_date, entry_price, exit_date,
-                exit_price, qty) -> dict`. If None, settlement is skipped
-                and the raw fill price difference stands as-is (no tax/fees
-                applied).
+                exit_price, qty) -> dict` (must contain "net_adjustment").
+                If None, settlement is skipped — raw fill price stands.
         """
-        self.event_bus: EventBus = event_bus
+        self.event_bus = event_bus
         self.available_cash: float = initial_capital
         self.initial_capital: float = initial_capital
 
-        # symbol -> deque of lots, each lot: {"quantity", "price", "timestamp"}
-        self.positions: Dict[str, deque] = {}
+        # PUBLIC flat view — this exact shape is read directly by
+        # mocks/kite_connect.py's positions()/ltp()/quote().
+        # symbol -> {"quantity", "average_price", "current_price",
+        #            "product", "exchange", "instrument_token"}
+        self.positions: Dict[str, Dict[str, Any]] = {}
 
-        # symbol -> last known unrealized P&L (recomputed on every mark_to_market)
-        self.unrealized_pnl: Dict[str, float] = {}
-
-        # symbol -> last seen market price (used by mark_to_market / equity calc)
-        self._last_price: Dict[str, float] = {}
+        # PRIVATE FIFO detail — symbol -> deque of lots:
+        # {"quantity", "price", "timestamp"}
+        self._lots: Dict[str, deque] = {}
 
         self.logger = logger
         self.tax_api = tax_api
@@ -98,17 +106,24 @@ class Portfolio:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _net_quantity(self, symbol: str) -> int:
-        """Returns the current net open quantity held for a symbol (sum of lots)."""
-        lots = self.positions.get(symbol)
-        if not lots:
-            return 0
-        return sum(lot["quantity"] for lot in lots)
-
     def _log(self, event: Any) -> None:
         """Safely logs an event if a logger was injected. No-op otherwise."""
         if self.logger is not None:
             self.logger.log_event(event)
+
+    def _ensure_position_entry(self, symbol: str) -> None:
+        """Creates an empty flat position entry for a symbol if absent."""
+        if symbol not in self.positions:
+            self.positions[symbol] = {
+                "quantity": 0,
+                "average_price": 0.0,
+                "current_price": 0.0,
+                "product": "MIS",
+                "exchange": "NSE",
+                "instrument_token": 0,
+            }
+        if symbol not in self._lots:
+            self._lots[symbol] = deque()
 
     # ------------------------------------------------------------------
     # Pre-fill validation (used by MatchingEngine before finalizing a fill)
@@ -117,16 +132,9 @@ class Portfolio:
     def can_afford(self, cost: float) -> bool:
         """
         Checks whether the portfolio currently has enough cash to cover a
-        prospective buy. MatchingEngine should call this BEFORE creating a
-        FillEvent for a BUY order, so insufficient-funds orders can be
-        rejected/partially-filled rather than silently overdrawing cash.
-
-        Args:
-            cost (float): The total cost of the prospective trade
-                (quantity * price), or quantity * price + estimated fees.
-
-        Returns:
-            bool: True if available_cash >= cost.
+        prospective buy. MatchingEngine should call this BEFORE finalizing
+        a BUY fill, so insufficient-funds orders can be rejected/partially
+        filled rather than silently overdrawing cash.
         """
         return self.available_cash >= cost
 
@@ -138,45 +146,45 @@ class Portfolio:
         """
         Updates positions and cash based on a newly filled order.
         If a position is closed (net quantity returns to zero), triggers
-        the settlement process via the optional tax_api, then finalizes
-        the ledger via adjust_cash.
+        settlement via the optional tax_api, then finalizes via adjust_cash.
 
-        This is the ONLY place transactions are recorded — whether they
-        originate purely from a fill, or are later adjusted by tax/fees,
-        everything funnels through this method (and adjust_cash).
-
-        Args:
-            fill_event (Any): The fill event indicating an executed trade.
-                Must expose: symbol, side, quantity, price.
-                Optionally: order_id, timestamp, fees.
+        Reads fields defensively (dict or object), using the same key
+        fallbacks as TransactionLogger: "tradingsymbol"/"symbol",
+        "transaction_type"/"side", "quantity", "price", optionally
+        "fees", "timestamp", "product", "exchange", "instrument_token".
         """
-        symbol: str = fill_event.symbol
-        side: str = fill_event.side
-        quantity: int = fill_event.quantity
-        price: float = fill_event.price
-        timestamp: str = getattr(fill_event, "timestamp", "")
-        fees: float = getattr(fill_event, "fees", 0.0)
+        symbol = _get(fill_event, "tradingsymbol", "symbol")
+        side = _get(fill_event, "transaction_type", "side")
+        quantity = _get(fill_event, "quantity", default=0)
+        price = _get(fill_event, "price", default=0.0)
+        timestamp = _get(fill_event, "timestamp", default="")
+        fees = _get(fill_event, "fees", default=0.0)
+        product = _get(fill_event, "product", default="MIS")
+        exchange = _get(fill_event, "exchange", default="NSE")
+        instrument_token = _get(fill_event, "instrument_token", default=0)
 
-        if symbol not in self.positions:
-            self.positions[symbol] = deque()
+        if symbol is None or side is None:
+            raise ValueError(
+                "FillEvent missing required symbol/side fields "
+                f"(got tradingsymbol/symbol={symbol}, "
+                f"transaction_type/side={side})"
+            )
 
-        lots = self.positions[symbol]
+        self._ensure_position_entry(symbol)
+        side = side.upper()
+        lots = self._lots[symbol]
 
-        if side.upper() == "BUY":
-            # Cash leaves immediately; a new lot is appended (FIFO order
-            # preserved by always appending to the back).
+        if side == "BUY":
             self.available_cash -= (quantity * price) + fees
             lots.append({
                 "quantity": quantity,
                 "price": price,
                 "timestamp": timestamp,
             })
+            self._recompute_flat_position(symbol, product, exchange, instrument_token, price)
             self._log(fill_event)
 
-        elif side.upper() == "SELL":
-            # Cash arrives immediately for the raw proceeds; lots are
-            # consumed FIFO (oldest first), splitting a lot if the sell
-            # quantity doesn't exactly match the lot at the front.
+        elif side == "SELL":
             self.available_cash += (quantity * price) - fees
 
             remaining_to_sell = quantity
@@ -185,12 +193,10 @@ class Portfolio:
             while remaining_to_sell > 0 and lots:
                 front_lot = lots[0]
                 if front_lot["quantity"] <= remaining_to_sell:
-                    # Consume the entire front lot.
                     realized_lots.append(front_lot)
                     remaining_to_sell -= front_lot["quantity"]
                     lots.popleft()
                 else:
-                    # Partially consume the front lot; reduce it in place.
                     realized_lots.append({
                         "quantity": remaining_to_sell,
                         "price": front_lot["price"],
@@ -199,14 +205,50 @@ class Portfolio:
                     front_lot["quantity"] -= remaining_to_sell
                     remaining_to_sell = 0
 
+            self._recompute_flat_position(symbol, product, exchange, instrument_token, price)
             self._log(fill_event)
 
-            # run settlement for each matched FIFO lot (entry) against this exit.
-            if realized_lots: # self._net_quantity(symbol) == 0 and realized_lots
+            if realized_lots: # flat["quantity"] == 0 and realized_lots
                 self._settle_realized_lots(realized_lots, price, timestamp)
 
         else:
             raise ValueError(f"Unknown fill side: {side!r}")
+
+    def _recompute_flat_position(
+        self, symbol: str, product: str, exchange: str, instrument_token: Any,
+        fill_price: float,
+    ) -> None:
+        """
+        Rebuilds the PUBLIC flat position entry for a symbol from its
+        private FIFO lots, so kite_connect.py's positions()/ltp()/quote()
+        always see an up-to-date aggregated view.
+
+        `fill_price` seeds `current_price` at the moment of the fill itself
+        (a real, observed price), so margins()/positions()/ltp()/quote()
+        never see a stale current_price=0.0 (or an unrelated old value) if
+        they're queried in the gap between a fill and the NEXT tick — the
+        only other thing that would otherwise update current_price is
+        mark_to_market(), which only runs once a new TickEvent arrives.
+        Once that next tick does arrive, mark_to_market() simply overwrites
+        this with the live tick price as usual — this is purely a sane
+        placeholder for the in-between window, not a permanent substitute.
+        """
+        lots = self._lots[symbol]
+        net_qty = sum(lot["quantity"] for lot in lots)
+
+        if net_qty == 0:
+            avg_price = 0.0
+        else:
+            cost_total = sum(lot["quantity"] * lot["price"] for lot in lots)
+            avg_price = cost_total / net_qty
+
+        flat = self.positions[symbol]
+        flat["quantity"] = net_qty
+        flat["average_price"] = avg_price
+        flat["current_price"] = fill_price
+        flat["product"] = product
+        flat["exchange"] = exchange
+        flat["instrument_token"] = instrument_token
 
     def _settle_realized_lots(
         self,
@@ -218,17 +260,7 @@ class Portfolio:
         """
         Runs settlement (tax/brokerage/fees) for each FIFO-matched entry lot
         against the exit price, applying the net adjustment to cash.
-
-        If `tax_api` was not provided, this is a no-op — the raw price
-        difference already booked via cash flow in update_from_fill stands
-        as the final number (no tax/fee adjustment applied).
-
-        Args:
-            symbol (str): The symbol whose position just closed.
-            realized_lots (List[Dict]): The individual entry lots consumed
-                to fulfill this exit, in FIFO order.
-            exit_price (float): The price the closing fill executed at.
-            exit_timestamp (str): The timestamp of the closing fill.
+        No-op if tax_api was not provided (detached).
         """
         if self.tax_api is None:
             return
@@ -248,59 +280,43 @@ class Portfolio:
     # Mark-to-market
     # ------------------------------------------------------------------
 
-    def mark_to_market(self, tick_event: TickEvent) -> None:
+    def mark_to_market(self, tick_event: Any) -> None:
         """
-        Updates the current market value of open positions based on the
-        latest tick, for the symbol that tick belongs to. Only affects
-        that one symbol's unrealized P&L — every other symbol's state is
-        untouched.
-
-        Args:
-            tick_event (TickEvent): The incoming tick event. Must expose `symbol`
-                and a price field (`last_price`, falling back to `close`).
+        Updates current_price for the symbol this tick belongs to, in the
+        PUBLIC flat positions view. Reads defensively: "tradingsymbol" or
+        "symbol" for the identifier, "last_price" or "close" for price.
+        Only affects that one symbol — every other symbol is untouched.
         """
-        symbol = tick_event.symbol
-        price = getattr(tick_event, "last_price", None)
-        if price is None:
-            price = getattr(tick_event, "close", None)
-        if price is None:
-            return  # Nothing usable to mark against.
-
-        self._last_price[symbol] = price
-
-        lots = self.positions.get(symbol)
-        if not lots:
-            self.unrealized_pnl[symbol] = 0.0
+        symbol = _get(tick_event, "tradingsymbol", "symbol")
+        price = _get(tick_event, "last_price", "close")
+        if symbol is None or price is None:
             return
 
-        cost_basis = sum(lot["quantity"] * lot["price"] for lot in lots)
-        held_qty = sum(lot["quantity"] for lot in lots)
-        market_value = held_qty * price
-        self.unrealized_pnl[symbol] = market_value - cost_basis
+        self._ensure_position_entry(symbol)
+        self.positions[symbol]["current_price"] = price
 
     # ------------------------------------------------------------------
     # Generic cash adjustment (used by settlement, and available externally)
     # ------------------------------------------------------------------
 
     def adjust_cash(self, amount: float) -> None:
-        """
-        Adjusts the available cash in the portfolio (e.g. for taxes,
-        dividends, or fees). Positive credits, negative debits.
-
-        Args:
-            amount (float): The amount to adjust.
-        """
+        """Adjusts available cash (e.g. for taxes, dividends, or fees)."""
         self.available_cash += amount
 
     # ------------------------------------------------------------------
-    # Convenience read-only views (useful for mocks/kite_connect.py later)
+    # Convenience read-only views
     # ------------------------------------------------------------------
 
     def get_equity(self) -> float:
         """Returns total equity: cash + unrealized P&L across all symbols."""
-        return self.available_cash + sum(self.unrealized_pnl.values())
+        total_unrealized = 0.0
+        for symbol, flat in self.positions.items():
+            qty = flat["quantity"]
+            if qty:
+                total_unrealized += (flat["current_price"] - flat["average_price"]) * qty
+        return self.available_cash + total_unrealized
 
-    def get_position_snapshot(self, symbol: str) -> List[Dict[str, Any]]:
-        """Returns a plain list copy of the current lots held for a symbol."""
-        lots = self.positions.get(symbol)
+    def get_lots_snapshot(self, symbol: str) -> List[Dict[str, Any]]:
+        """Returns a plain list copy of the current FIFO lots for a symbol (debug/testing only)."""
+        lots = self._lots.get(symbol)
         return list(lots) if lots else []
