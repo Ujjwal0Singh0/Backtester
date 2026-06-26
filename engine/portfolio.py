@@ -33,6 +33,15 @@ from settlement.tax_dividend_api import TaxDividendAPI
 from metrics.transaction_logger import TransactionLogger
 
 
+def _sign(value: float) -> int:
+    """Returns +1, -1, or 0 for the sign of a numeric value."""
+    if value > 0:
+        return 1
+    if value < 0:
+        return -1
+    return 0
+
+
 def _get(event: Any, *keys: str, default: Any = None) -> Any:
     """
     Reads a field off an event that may be a dict OR an object, trying
@@ -176,43 +185,111 @@ class Portfolio:
 
         if side == "BUY":
             self.available_cash -= (quantity * price) + fees
-            lots.append({
-                "quantity": quantity,
-                "price": price,
-                "timestamp": timestamp,
-            })
+            # direction = +1 (opening long). Close phase covers any existing
+            # SHORT lots (negative quantity) first, FIFO; open phase appends
+            # whatever's left as a new long lot.
+            realized_lots = self._apply_fifo(
+                lots, quantity, price, timestamp,
+                closing_lot_sign=-1, opening_sign=+1,
+            )
             self._recompute_flat_position(symbol, product, exchange, instrument_token, price)
             self._log(fill_event)
 
         elif side == "SELL":
             self.available_cash += (quantity * price) - fees
-
-            remaining_to_sell = quantity
-            realized_lots: List[Dict[str, Any]] = []
-
-            while remaining_to_sell > 0 and lots:
-                front_lot = lots[0]
-                if front_lot["quantity"] <= remaining_to_sell:
-                    realized_lots.append(front_lot)
-                    remaining_to_sell -= front_lot["quantity"]
-                    lots.popleft()
-                else:
-                    realized_lots.append({
-                        "quantity": remaining_to_sell,
-                        "price": front_lot["price"],
-                        "timestamp": front_lot["timestamp"],
-                    })
-                    front_lot["quantity"] -= remaining_to_sell
-                    remaining_to_sell = 0
-
+            # direction = -1 (opening short). Close phase consumes any
+            # existing LONG lots (positive quantity) first, FIFO; open phase
+            # appends whatever's left as a new SHORT lot (negative qty) 
+            realized_lots = self._apply_fifo(
+                lots, quantity, price, timestamp,
+                closing_lot_sign=+1, opening_sign=-1,
+            )
             self._recompute_flat_position(symbol, product, exchange, instrument_token, price)
             self._log(fill_event)
 
-            if realized_lots: # flat["quantity"] == 0 and realized_lots
-                self._settle_realized_lots(realized_lots, price, timestamp)
-
         else:
             raise ValueError(f"Unknown fill side: {side!r}")
+
+        # Settle every realized (closed) lot as its own round trip — entry
+        # is the lot being closed, exit is this fill. This fires whenever
+        # ANY closing happened, not only when the position returns to
+        # exactly flat, so partial closes/covers are settled correctly too.
+        #
+        # `trade_side` tells tax_api which direction this round trip was:
+        # - BUY closing short lots  -> "SHORT" (entry=original short sell,
+        #   exit=this covering buy; profit = entry_price - exit_price)
+        # - SELL closing long lots  -> "LONG"  (entry=original buy,
+        #   exit=this sell; profit = exit_price - entry_price)
+        # Without this, a generic (exit - entry) formula silently reports
+        # a profitable short as a loss, since the raw numbers alone don't
+        # say which direction the trade was.
+
+        trade_side = "SHORT" if side == "BUY" else "LONG"
+        if realized_lots:
+            self._settle_realized_lots(realized_lots, price, timestamp, trade_side)
+
+    @staticmethod
+    def _apply_fifo(
+        lots: deque,
+        quantity: int,
+        price: float,
+        timestamp: str,
+        closing_lot_sign: int,
+        opening_sign: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generic two-phase FIFO application, symmetric for both directions:
+
+        Phase 1 (close): consume lots at the FRONT of the deque whose
+        quantity sign matches `closing_lot_sign`, reducing/removing them,
+        until either `quantity` is exhausted or no more closable lots
+        remain. Each unit consumed here is a completed round trip and is
+        returned for settlement.
+
+        Phase 2 (open): if any of `quantity` remains after phase 1 (no more
+        opposite-signed lots to close against), append a NEW lot in the
+        `opening_sign` direction for the remainder — this is what makes
+        short-selling (and going long again after fully covering a short)
+        work, instead of silently discarding leftover quantity.
+
+        Returns:
+            List[Dict]: realized lots consumed during the close phase, each
+            with a positive "quantity" (magnitude) for settlement purposes.
+        """
+        remaining = quantity
+        realized_lots: List[Dict[str, Any]] = []
+
+        while remaining > 0 and lots and _sign(lots[0]["quantity"]) == closing_lot_sign:
+            front_lot = lots[0]
+            front_qty_abs = abs(front_lot["quantity"])
+
+            if front_qty_abs <= remaining:
+                realized_lots.append({
+                    "quantity": front_qty_abs,
+                    "price": front_lot["price"],
+                    "timestamp": front_lot["timestamp"],
+                })
+                remaining -= front_qty_abs
+                lots.popleft()
+            else:
+                realized_lots.append({
+                    "quantity": remaining,
+                    "price": front_lot["price"],
+                    "timestamp": front_lot["timestamp"],
+                })
+                front_lot["quantity"] -= remaining * closing_lot_sign
+                remaining = 0
+
+        if remaining > 0:
+            # Nothing left to close against — open a new lot in this
+            # fill's own direction (long for BUY, short for SELL).
+            lots.append({
+                "quantity": remaining * opening_sign,
+                "price": price,
+                "timestamp": timestamp,
+            })
+
+        return realized_lots
 
     def _recompute_flat_position(
         self, symbol: str, product: str, exchange: str, instrument_token: Any,
@@ -252,16 +329,39 @@ class Portfolio:
 
     def _settle_realized_lots(
         self,
-      # symbol: str,
         realized_lots: List[Dict[str, Any]],
         exit_price: float,
         exit_timestamp: str,
+        trade_side: str
     ) -> None:
         """
         Runs settlement (tax/brokerage/fees) for each FIFO-matched entry lot
         against the exit price, applying the net adjustment to cash.
         No-op if tax_api was not provided (detached).
+
+        Note: "entry" and "exit" here are relative to direction — for a
+        long position, entry=buy/exit=sell as usual; for a covered short,
+        entry=the original short sell/exit=this covering buy. The tax_api
+        contract doesn't need to know which case it is; it just receives
+        an entry price/date and an exit price/date.
+
+        `trade_side` is "LONG" or "SHORT" and is passed through to tax_api
+        explicitly, because entry_price/exit_price alone are direction-
+        agnostic numbers — without knowing which side the trade was, a
+        generic (exit_price - entry_price) profit formula would silently
+        compute a profitable SHORT as a loss (and vice versa for a losing
+        short reported as a gain). For LONG: profit = exit - entry. For
+        SHORT: profit = entry - exit (entry being the original short sell
+        price, exit being the covering buy price).
+
+        NOTE: this assumes tax_dividend_api.calculate_settlement() accepts
+        a `side` keyword and uses it to pick the correct profit sign. This
+        needs to be confirmed with whoever implements that module — if its
+        signature doesn't support a side/direction argument yet, it will
+        need to be added there too, or this call will need adjusting to
+        match whatever contract is actually agreed.
         """
+
         if self.tax_api is None:
             return
 
@@ -272,6 +372,7 @@ class Portfolio:
                 exit_date=exit_timestamp,
                 exit_price=exit_price,
                 qty=lot["quantity"],
+                side=trade_side,
             )
             net_adjustment = result.get("net_adjustment", 0.0)
             self.adjust_cash(net_adjustment)
@@ -280,7 +381,7 @@ class Portfolio:
     # Mark-to-market
     # ------------------------------------------------------------------
 
-    def mark_to_market(self, tick_event: Any) -> None:
+    def mark_to_market(self, tick_event: TickEvent) -> None:
         """
         Updates current_price for the symbol this tick belongs to, in the
         PUBLIC flat positions view. Reads defensively: "tradingsymbol" or
