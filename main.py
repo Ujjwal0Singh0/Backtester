@@ -12,7 +12,10 @@ Dependency order (each step only needs things built in earlier steps):
     4. TransactionLogger   - optional, standalone (no dependencies)
     5. TaxDividendAPI      - optional, standalone (no dependencies)
     6. Portfolio           - needs event_bus, optionally logger + tax_api
-    7. MockKiteConnect     - needs event_bus
+    7. MockKiteConnect     - needs event_bus AND portfolio (REQUIRED — see
+                             mocks/kite_connect.py's __init__ signature,
+                             since margins()/positions() read live values
+                             straight off the Portfolio instance)
     8. MockKiteTicker      - standalone
     9. Strategy            - needs the two mocks
    10. Wire mock_ticker's callbacks to the strategy's methods
@@ -47,8 +50,10 @@ END_DATE = "2023-12-31"
 INITIAL_CAPITAL = 100000.0
 
 DATA_DIR = "data_cache/"
-
 TRADE_LOG_PATH = "trades_journal.csv"
+
+API_KEY = ""
+ACCESS_TOKEN = ""
 
 
 def main(
@@ -99,7 +104,9 @@ def main(
     logger = TransactionLogger(log_filepath=trade_log_path) if enable_logger else None
     tax_api = TaxDividendAPI() if enable_tax_api else None
 
-    # 6. Portfolio (the ledger)
+    # 6. Portfolio (the ledger) — must exist BEFORE MockKiteConnect, since
+    # MockKiteConnect.__init__ requires a portfolio reference to serve
+    # margins()/positions()/ltp()/quote() queries.
     portfolio = Portfolio(
         event_bus=event_bus,
         initial_capital=initial_capital,
@@ -107,9 +114,15 @@ def main(
         tax_api=tax_api,
     )
 
-    # 7 & 8. Mock broker layer
-    mock_kite = MockKiteConnect(api_key="mock_api_key", event_bus=event_bus)
-    mock_ticker = MockKiteTicker(api_key="mock_api_key")
+    # 7 & 8. Mock broker layer. NOTE: MockKiteConnect now requires
+    # `portfolio` as a positional/keyword arg (see mocks/kite_connect.py).
+    mock_kite = MockKiteConnect(
+        api_key=API_KEY,
+        event_bus=event_bus,
+        portfolio=portfolio,
+        access_token=ACCESS_TOKEN
+    )
+    mock_ticker = MockKiteTicker(api_key=API_KEY, access_token=ACCESS_TOKEN)
 
     # 9. Strategy, injected with the mock REST + WebSocket clients
     strategy = ExampleStrategy(kite_connect=mock_kite, kws=mock_ticker)
