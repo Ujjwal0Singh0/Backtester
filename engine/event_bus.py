@@ -24,7 +24,7 @@ class EventBus:
         Args:
             event (Any): The event to publish (TickEvent, OrderEvent, FillEvent, etc.).
         """
-        raise NotImplementedError
+        self.queue.append(event)
 
     def get_next_event(self) -> Any:
         """
@@ -33,7 +33,9 @@ class EventBus:
         Returns:
             Any: The next event, or None if the queue is empty.
         """
-        raise NotImplementedError
+        if self.queue:
+            return self.queue.popleft()
+        return None
         
     def has_events(self) -> bool:
         """
@@ -42,4 +44,4 @@ class EventBus:
         Returns:
             bool: True if events exist, False otherwise.
         """
-        raise NotImplementedError
+        return len(self.queue) > 0
