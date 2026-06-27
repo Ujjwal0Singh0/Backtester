@@ -4,7 +4,7 @@ Evaluates orders against ticks (Volume/Latency rules).
 
 from engine.event_bus import EventBus
 from typing import Any, Dict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 
@@ -61,13 +61,15 @@ class MatchingEngine:
         self.pending_limits: dict[str, list[OrderEvent]] = {}
         self.pending_markets: dict[str, list[OrderEvent]] = {}
 
-    def process_order(self, order_event: Any) -> None:
+    def process_order(self, order_event: OrderEvent) -> None:  # Changed from Any -> OrderEvent for stronger type safety.
+        # Type narrowed from Any to OrderEvent since this function directly accesses
+        # OrderEvent-specific attributes (timestamp, order_type, activation_time, etc.).
         """
         Receives an OrderEvent and adds it to the internal open orders list.
         Because of latency, ALL orders are queued and stamped with an activation time.
         
         Args:
-            order_event (Any): The order event to track.
+            order_event (OrderEvent): The order to be queued for execution.
         """
         order_event.activation_time = order_event.timestamp + self.latency
         
@@ -85,7 +87,11 @@ class MatchingEngine:
         Args:
             tick_event (dict): The incoming tick event formatted as a dictionary from the Simulator.
         """
-        symbol = tick_event["symbol"]
+        # Defensive programming: safely handle malformed tick events instead of
+        # raising a KeyError and terminating the simulation.
+        symbol = tick_event.get("symbol")
+        if symbol is None:
+            return
         
         # Parse timestamp and fix timezone aware/naive mismatch (Bug 5)
         tick_time = tick_event.get("datetime") or datetime.strptime(tick_event["timestamp"], "%Y-%m-%d %H:%M:%S")
@@ -157,7 +163,13 @@ class MatchingEngine:
             self.pending_limits[symbol] = surviving_limits
 
 
-    def _execute_market_order(self, order: Any, tick: dict, tick_time: datetime) -> None:
+    def _execute_market_order(
+            self,
+            order: OrderEvent,           # Changed from Any for explicit interface definition.
+            tick: Dict[str, Any],
+            tick_time: datetime,
+        ) -> None:
+
         """
         Executes a MARKET order using L2 Depth and Synthetic Extrapolation.
         Strictly caps total execution at 5% of tick volume.
