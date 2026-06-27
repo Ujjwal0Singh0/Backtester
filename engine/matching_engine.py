@@ -3,8 +3,7 @@ Evaluates orders against ticks (Volume/Latency rules).
 """
 
 from engine.event_bus import EventBus
-from data.tick_generator import TickEvent
-from typing import Any
+from typing import Any, Dict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -77,19 +76,21 @@ class MatchingEngine:
         elif order_event.order_type == "LIMIT":
             self.pending_limits.setdefault(order_event.symbol, []).append(order_event)
 
-    def evaluate_ticks(self, tick_event: TickEvent) -> None:
+    def evaluate_ticks(self, tick_event: dict) -> None:
         """
-        Evaluates all pending open orders against the new TickEvent.
+        Evaluates all pending open orders against the new TickEvent (parsed as a dict).
         Applies pessimistic rules (e.g., volume limits, strict limit price checking).
         If an order is filled, generates a FillEvent and publishes it to the event_bus.
         
         Args:
-            tick_event (TickEvent): The incoming tick event.
+            tick_event (dict): The incoming tick event formatted as a dictionary from the Simulator.
         """
-        # Note: If TickEvent is a class object instead of a dict, change these dict 
-        # accesses (e.g., tick_event["symbol"]) to attribute accesses (e.g., tick_event.symbol)
         symbol = tick_event["symbol"]
+        
+        # Parse timestamp and fix timezone aware/naive mismatch (Bug 5)
         tick_time = tick_event.get("datetime") or datetime.strptime(tick_event["timestamp"], "%Y-%m-%d %H:%M:%S")
+        if tick_time.tzinfo is not None:
+            tick_time = tick_time.replace(tzinfo=None)
 
         # --- GATE 1: Process Delayed Market Orders ---
         if symbol in self.pending_markets:
@@ -107,7 +108,9 @@ class MatchingEngine:
         if symbol in self.pending_limits:
             ohlc = tick_event["ohlc"]
             tick_vol = tick_event["volume"]
-            max_fill_allowance = int(tick_vol * self.volume_cap)
+            
+            # Clamp allowance to prevent silent stalls on low-volume ticks (Bug 6)
+            max_fill_allowance = max(1, int(tick_vol * self.volume_cap)) if tick_vol > 0 else 0
             
             surviving_limits = []
 
@@ -135,10 +138,10 @@ class MatchingEngine:
 
                 # Gate 3: State Persistence & Partial Fills
                 if filled_this_tick > 0:
-                    # Note: Adjust .append() to .publish() or .put() if your EventBus class requires it
-                    self.event_bus.append(FillEvent(
+                    # Corrected to .publish() and added latency to timestamp (Bugs 1 & 2)
+                    self.event_bus.publish(FillEvent(
                         order_id=order.order_id,
-                        timestamp=tick_time,
+                        timestamp=tick_time + self.latency,
                         symbol=order.symbol,
                         side=order.side,
                         quantity=filled_this_tick,
@@ -154,7 +157,7 @@ class MatchingEngine:
             self.pending_limits[symbol] = surviving_limits
 
 
-    def _execute_market_order(self, order: Any, tick: TickEvent, tick_time: datetime) -> None:
+    def _execute_market_order(self, order: Any, tick: dict, tick_time: datetime) -> None:
         """
         Executes a MARKET order using L2 Depth and Synthetic Extrapolation.
         Strictly caps total execution at 5% of tick volume.
@@ -163,8 +166,9 @@ class MatchingEngine:
         book_side = "sell" if order.side == "BUY" else "buy"
         visible_levels = tick.get("depth", {}).get(book_side, [])
 
-        # The absolute hard limit this order is allowed to consume
-        max_allowable_qty = int(tick["volume"] * self.volume_cap)
+        tick_vol = tick.get("volume", 0)
+        # Clamp allowance to prevent silent stalls on low-volume ticks (Bug 6)
+        max_allowable_qty = max(1, int(tick_vol * self.volume_cap)) if tick_vol > 0 else 0
 
         remaining_qty = order.quantity 
         filled_this_tick = 0
@@ -219,8 +223,8 @@ class MatchingEngine:
         if filled_this_tick > 0:
             final_vwap = round(total_cost / filled_this_tick, 2)
             
-            # Note: Adjust .append() to .publish() or .put() if your EventBus class requires it
-            self.event_bus.append(FillEvent(
+            # Corrected to .publish() (Bug 1)
+            self.event_bus.publish(FillEvent(
                 order_id=order.order_id,
                 timestamp=tick_time + self.latency,
                 symbol=order.symbol,
