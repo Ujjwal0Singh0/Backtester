@@ -1,12 +1,13 @@
 """
 The main chronological 'while' loop runner.
 """
+from typing import Any
+from datetime import datetime
 
 from engine.event_bus import EventBus
-from data.tick_generator import TickGenerator
-from engine.matching_engine import MatchingEngine
+from engine.matching_engine import MatchingEngine, OrderEvent, FillEvent
 from engine.portfolio import Portfolio
-from typing import Any
+from data.tick_generator import TickGenerator, TickEvent
 
 class Simulator:
     """
@@ -67,31 +68,50 @@ class Simulator:
                 if event is None:
                     continue
 
+                # Adapt TickEvent into the dictionary format expected by MatchingEngine.
+                # TickGenerator currently provides only last traded price, so we
+                # approximate OHLC and leave market depth empty until richer data
+                # is available.
+
                 # Tick Events
                 if isinstance(event, TickEvent):
 
                     # Update unrealized PnL.
                     self.portfolio.mark_to_market(event)
 
-                    # Notify the trading strategy.
-                    # Strategy may generate new OrderEvents.
+                    # Adapt TickEvent into the format expected by MatchingEngine.
+                    tick_dict = {
+                        "symbol": event.symbol,
+                        "timestamp": event.timestamp,
+                        "datetime": datetime.fromisoformat(
+                            event.timestamp.replace("Z", "+00:00")
+                        ).replace(tzinfo=None),
+                        "volume": event.volume,
+                        "ohlc": {
+                            "open": event.last_price,
+                            "high": event.last_price,
+                            "low": event.last_price,
+                            "close": event.last_price,
+                        },
+                        "depth": {
+                            "buy": [],
+                            "sell": [],
+                        },
+                    }
+
+                    # First execute all resting orders against the latest market data.
+                    self.matching_engine.evaluate_ticks(tick_dict)
+
+                    # Then allow the strategy to react to the new tick.
                     self.strategy.on_ticks(None, [event])
 
-                    # TODO:
-                    # self.matching_engine.evaluate_ticks(event)
-
-
                 # Order Events
-                elif isinstance(event, dict):
+                elif isinstance(event, OrderEvent):
 
-                    if event.get("event_type") == "ORDER":
+                    # Queue the order until it becomes eligible for execution.
+                    self.matching_engine.process_order(event)
 
-                        # TODO:
-                        # self.matching_engine.process_order(event)
-                        pass
+                elif isinstance(event, FillEvent):
 
-                    elif event.get("event_type") == "FILL":
-
-                        # TODO:
-                        # self.portfolio.update_from_fill(event)
-                        pass
+                    # Apply the execution to portfolio state.
+                    self.portfolio.update_from_fill(event)
