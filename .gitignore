@@ -1,5 +1,6 @@
 .venv/
 __pycache__/
+/implementation_notes/
 
 # current folder which contains data from ingestion.py
 # mentioned in main.py
@@ -8,5 +9,3 @@ __pycache__/
 # current file which contains transaction logs from transaction_logger
 # mentioned in main.py
 /trades_journal.csv
-
-/backtester.pdf
