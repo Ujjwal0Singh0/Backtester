@@ -2,8 +2,11 @@
 MockREST API (margins, place_order, positions).
 """
 import uuid 
-from engine.event_bus import EventBus
+from datetime import datetime
 from typing import Dict, Any, List
+
+from engine.event_bus import EventBus
+from engine.matching_engine import OrderEvent 
 
 class MockKiteConnect:
     """
@@ -55,24 +58,33 @@ class MockKiteConnect:
     MARGIN_EQUITY    = "equity"
     MARGIN_COMMODITY = "commodity"
 
-    def __init__(self, api_key: str, event_bus: EventBus, portfolio:Any, access_token:str =None):
+    def __init__(self, api_key: str, event_bus: EventBus, portfolio: Any, access_token: str = None):
         """
         Initializes the Mock KiteConnect.
-        
-        Args:
-            api_key (str): Mock API key.
-            event_bus (EventBus): The centralized event bus to route orders.
         """
         self.api_key      = api_key
         self.access_token = access_token
         self.event_bus    = event_bus
         self.portfolio    = portfolio
         self._order_book: Dict[str, Dict[str, Any]] = {}
+        
+        # Added to maintain historical simulation time
+        self._sim_time: datetime = None
     
     def set_access_token(self, access_token: str) -> None:
         self.access_token = access_token
+
+    def sync_time(self, current_time: datetime) -> None:
+        """
+        Keeps the mock API synchronized with the simulator's historical clock.
+        Must be called by the simulator tick loop.
+        """
+        self._sim_time = current_time
+
+    def _get_current_time(self) -> datetime:
+        return self._sim_time if self._sim_time else datetime.utcnow()
     
-    #order management
+    # --- ORDER MANAGEMENT ---
 
     def place_order(self, variety: str, exchange: str, tradingsymbol: str, 
                     transaction_type: str, quantity: int, product: str, 
@@ -82,13 +94,13 @@ class MockKiteConnect:
                     trailing_stoploss: float = None, tag: str = None) -> str:
         """
         Mocks placing an order. Queues an OrderEvent.
-        
-        Returns:
-            str: A mocked order ID."""
+        """
         order_id = f"MOCK{uuid.uuid4().hex[:11].upper()}"
-        order_event = {
-            "event_type":         "ORDER",
+        
+        # 1. Store the rich metadata in the internal dictionary
+        order_dict = {
             "order_id":           order_id,
+            "timestamp":          self._get_current_time(),
             "variety":            variety,
             "exchange":           exchange,
             "tradingsymbol":      tradingsymbol,
@@ -105,12 +117,30 @@ class MockKiteConnect:
             "trailing_stoploss":  trailing_stoploss,
             "tag":                tag,
             "status":             "OPEN",
+            "filled_quantity":    0,
+            "pending_quantity":   quantity,
+            "average_price":      0.0,
         }
- 
-        # Store in internal order book so orders() can return it
-        self._order_book[order_id] = order_event 
-        # Push onto the EventBus — matching engine picks this up on the next tick
+        self._order_book[order_id] = order_dict 
+
+        # 2. Construct the exact OrderEvent object expected by simulator.py
+        order_event = OrderEvent(
+            order_id=order_id,
+            timestamp=order_dict["timestamp"],
+            symbol=tradingsymbol,
+            side=transaction_type.upper(),
+            order_type=order_type.upper(),
+            quantity=quantity,
+            price=order_dict["price"]
+        )
+        
+        # 3. Attach the rich dictionary to avoid Data Loss
+        order_event.meta = order_dict 
+        order_event.action = "NEW" 
+        
+        # 4. Push onto the EventBus
         self.event_bus.publish(order_event)
+        
         return order_id
     
     def modify_order(self, variety: str, order_id: str,
@@ -120,41 +150,63 @@ class MockKiteConnect:
                     order_type: str = None, trigger_price: float = None,
                     validity: str = None,
                     disclosed_quantity: int = None) -> str:
+        
         if order_id in self._order_book:
+            orig_order = self._order_book[order_id]
+            
+            # Update local book
             if quantity is not None:
-                self._order_book[order_id]["quantity"] = quantity
+                orig_order["quantity"] = quantity
+                orig_order["pending_quantity"] = max(0, quantity - orig_order.get("filled_quantity", 0))
             if price is not None:
-                self._order_book[order_id]["price"] = float(price)
+                orig_order["price"] = float(price)
+
+            # Publish the modification to the matching engine
+            modify_event = OrderEvent(
+                order_id=order_id,
+                timestamp=self._get_current_time(),
+                symbol=orig_order["tradingsymbol"],
+                side=orig_order["transaction_type"],
+                order_type=orig_order["order_type"],
+                quantity=orig_order["quantity"],
+                price=orig_order["price"]
+            )
+            modify_event.meta = orig_order
+            modify_event.action = "MODIFY"
+            
+            self.event_bus.publish(modify_event)
+            
         return order_id
     
     def cancel_order(self, variety: str, order_id: str,
                     parent_order_id: str = None) -> str:
+        
         if order_id in self._order_book:
-            self._order_book[order_id]["status"] = "CANCELLED"
+            orig_order = self._order_book[order_id]
+            orig_order["status"] = "CANCELLED"
+            orig_order["pending_quantity"] = 0
+            
+            # Publish the cancellation to the matching engine
+            cancel_event = OrderEvent(
+                order_id=order_id,
+                timestamp=self._get_current_time(),
+                symbol=orig_order["tradingsymbol"],
+                side=orig_order["transaction_type"],
+                order_type=orig_order["order_type"],
+                quantity=0,
+                price=0.0
+            )
+            cancel_event.meta = orig_order
+            cancel_event.action = "CANCEL"
+            
+            self.event_bus.publish(cancel_event)
+            
         return order_id
     
     def orders(self) -> List[Dict[str, Any]]:
         result = []
         for order_id, ev in self._order_book.items():
-            result.append({
-                "order_id":           order_id,
-                "tradingsymbol":      ev.get("tradingsymbol", ""),
-                "exchange":           ev.get("exchange", ""),
-                "transaction_type":   ev.get("transaction_type", ""),
-                "quantity":           ev.get("quantity", 0),
-                "price":              ev.get("price", 0.0),
-                "trigger_price":      ev.get("trigger_price", 0.0),
-                "product":            ev.get("product", ""),
-                "order_type":         ev.get("order_type", ""),
-                "variety":            ev.get("variety", ""),
-                "status":             ev.get("status", "OPEN"),
-                "filled_quantity":    ev.get("filled_quantity", 0),
-                "pending_quantity":   ev.get("pending_quantity", ev.get("quantity", 0)),
-                "cancelled_quantity": ev.get("cancelled_quantity", 0),
-                "average_price":      ev.get("average_price", 0.0),
-                "validity":           ev.get("validity", self.VALIDITY_DAY),
-                "tag":                ev.get("tag", ""),
-            })
+            result.append(ev)
         return result
 
     def update_order_status(self, order_id: str, status: str,
@@ -171,15 +223,9 @@ class MockKiteConnect:
                     0, original_qty - filled_qty
                 )
 
-    #portfolio queries
+    # --- PORTFOLIO QUERIES ---
 
     def margins(self) -> Dict[str, Any]:
-        """
-        Mocks fetching margin details.
-        
-        Returns:
-            Dict[str, Any]: Mock margin data.
-        """
         cash_balance    = getattr(self.portfolio, "available_cash",  0.0)
         opening_balance = getattr(self.portfolio, "initial_capital", cash_balance)
  
@@ -216,12 +262,6 @@ class MockKiteConnect:
         }
     
     def positions(self) -> Dict[str, Any]:
-        """
-        Mocks fetching active positions.
-        
-        Returns:
-            Dict[str, Any]: Mock positions data.
-        """
         formatted_positions = []
         positions_dict = getattr(self.portfolio, "positions", {})
  
@@ -279,7 +319,6 @@ class MockKiteConnect:
         positions_dict = getattr(self.portfolio, "positions", {})
  
         for instrument in instruments:
-            # Handle both "NSE:RELIANCE" and plain "RELIANCE"
             if ":" in instrument:
                 _, symbol = instrument.split(":", 1)
             else:
@@ -338,7 +377,3 @@ class MockKiteConnect:
             }
  
         return result
-
-
-
-
