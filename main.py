@@ -76,22 +76,26 @@ RUN_INGESTION = True
 # Step 0 helper — kept separate so main() stays readable
 # ---------------------------------------------------------------------------
 
+FREQUENCY = "minute"  # bar frequency used by both ingestion and tick generator
+
+
 def _run_ingestion(
     api_key: str,
     symbol: str,
     start_date: str,
     end_date: str,
     data_dir: str,
+    frequency: str,
 ) -> None:
     """
     Fetches historical minute bars for `symbol` and saves them as a
-    Parquet file at `data_dir/<symbol>.parquet`.
+    Parquet file at `data_dir/ohlcv_{frequency}.parquet`.
 
     Called once at startup (before the simulation loop) if RUN_INGESTION
     is True. If the file already exists you can skip this by setting
     RUN_INGESTION = False at the top of this file.
     """
-    filepath = os.path.join(data_dir, f"{symbol}.parquet")
+    filepath = os.path.join(data_dir, f"ohlcv_{frequency}.parquet")
 
     ingestion = DataIngestion(api_key=api_key)
 
@@ -100,7 +104,7 @@ def _run_ingestion(
         symbol=symbol,
         start_date=start_date,
         end_date=end_date,
-        auto_retry=True,        # Let the smart retry fix date-range mismatches
+        frequency=frequency,
     )
 
     if not raw_data:
@@ -161,9 +165,10 @@ def main(
             start_date=start_date,
             end_date=end_date,
             data_dir=data_dir,
+            frequency=FREQUENCY,
         )
     else:
-        expected_path = os.path.join(data_dir, f"{symbol}.parquet")
+        expected_path = os.path.join(data_dir, f"ohlcv_{FREQUENCY}.parquet")
         if not os.path.exists(expected_path):
             raise FileNotFoundError(
                 f"RUN_INGESTION is False but no cached file found at {expected_path}. "
@@ -175,7 +180,7 @@ def main(
     event_bus = EventBus()
 
     # 2. Data source (reads the Parquet file we just cached above)
-    tick_generator = TickGenerator(data_dir=data_dir)
+    tick_generator = TickGenerator(data_dir=data_dir, frequency=FREQUENCY)
 
     # 3. Matching engine
     matching_engine = MatchingEngine(event_bus=event_bus)
